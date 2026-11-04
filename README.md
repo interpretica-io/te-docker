@@ -37,23 +37,41 @@ triplet of its `TE_PLATFORM`:
 llvm-mingw is at the end of `PATH`. Its `x86_64-w64-mingw32-*` wrappers do
 not hide the MinGW-w64 of the distribution.
 
-The license of Apple does not let the image carry the SDK of macOS. Mount one
-from a Mac (Xcode or the Command Line Tools) at `/opt/macos-sdk`:
+The license of Apple does not let the image carry the SDK of Xcode. The
+image has an open SDK in `/opt/macos-sdk-open` instead, made from:
+
+- the libc files of [Zig](https://ziglang.org): the headers of the C
+  library of macOS and `libSystem.tbd`, the list of the symbols of
+  libSystem for the linker (MIT);
+- the headers which Zig leaves out, from the open sources of Apple under
+  APSL 2.0: `netinet/{icmp6,if_ether,ip_icmp,ip6}.h` from
+  [xnu](https://github.com/apple-oss-distributions/xnu), `rpc/*.h` from
+  [Libinfo](https://github.com/apple-oss-distributions/Libinfo), and
+  `sys/syscall.h`, made from the table of the system calls of xnu.
+
+It has no frameworks: the agents link only libSystem. `macos-open-sdk`
+makes the SDK from the files of Zig. It also fixes `libSystem.tbd` for
+`ld64.lld`, which takes neither `arm64e` for `arm64` nor `arm64e.x1`.
+
+An SDK of Xcode or the Command Line Tools mounted at `/opt/macos-sdk` takes
+the place of the open one:
 
 ```sh
 docker run -v /Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk:/opt/macos-sdk:ro ...
 ```
 
 The `*-apple-darwin-*` tools are links to `apple-darwin-wrap`. It takes the
-SDK from `MACOS_SDK` (default `/opt/macos-sdk`) and the oldest macOS to run
-on from `MACOS_MIN` (default `11.0`).
+SDK from `MACOS_SDK` (default `/opt/macos-sdk`), or `MACOS_OPEN_SDK`
+(default `/opt/macos-sdk-open`) if there is none there, and the oldest macOS
+to run on from `MACOS_MIN` (default `11.0`).
 
-The Unix agent needs PCRE2 (for ta_job) of the target. It cannot be built
-without the SDK, so the image carries its sources: the first call of a
-compiler wrapper or `pkg-config` builds a static PCRE2 into
-`$MACOS_DEPS/<triplet>` (default `/opt/macos-deps`). Mount a volume there
-to keep it between containers. `pkg-config` sees only the libraries there
-and in `MACOS_PKG_CONFIG_LIBDIR`, never the libraries of the image.
+The Unix agent needs PCRE2 (for ta_job) and libpcap (for TAD) of the
+target. They cannot be built without an SDK, so the image carries their
+sources: the first call of a compiler wrapper or `pkg-config` builds static
+libraries into `$MACOS_DEPS/<triplet>` (default `/opt/macos-deps`). libpcap
+is built only if the SDK lacks it: the SDK of Xcode has one. Mount a volume
+there to keep them between containers. `pkg-config` sees only the libraries
+there and in `MACOS_PKG_CONFIG_LIBDIR`, never the libraries of the image.
 
 The sniffers of the agent need Linux: give the agent type of macOS
 `--without-sniffers`.

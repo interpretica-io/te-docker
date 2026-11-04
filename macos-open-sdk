@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 Interpretica, Unipessoal Lda. All rights reserved.
+"""Make an SDK of macOS from the libc files of Zig.
+
+macos-open-sdk ZIG_LIBC DEST
+
+ZIG_LIBC is lib/libc of a Zig release. Zig carries the headers of the C
+library of macOS, made from the open sources of Apple, and libSystem.tbd,
+the list of the symbols of libSystem for the linker. That is enough for
+programs which need only libSystem: no frameworks.
+
+The .tbd of Zig needs two fixes for ld64.lld. It names arm64e and not
+arm64 where both have the same symbols, since the linker of Zig takes one
+for the other; ld64.lld does not. It also names arm64e.x1, which ld64.lld
+does not know.
+"""
+import json
+import os
+import re
+import shutil
+import sys
+
+# The libraries which are a part of libSystem on macOS
+LIBSYSTEM_ALIASES = ['System.B', 'c', 'dbm', 'dl', 'gcc_s.1', 'info', 'm',
+                     'poll', 'proc', 'pthread', 'rpcsvc']
+
+
+def fix_targets(match):
+    targets = [t.strip() for t in match.group(1).split(',')]
+    targets = [t for t in targets if t and not t.startswith('arm64e.x1-')]
+    for t in list(targets):
+        if t.startswith('arm64e-'):
+            arm64 = 'arm64-' + t[len('arm64e-'):]
+            if arm64 not in targets:
+                targets.insert(targets.index(t), arm64)
+    return 'targets: [ ' + ', '.join(targets) + ' ]'
+
+
+def main():
+    libc, dest = sys.argv[1:]
+    with open(os.path.join(libc, 'darwin', 'SDKSettings.json')) as f:
+        version = json.load(f)['Version']
+
+    shutil.copytree(os.path.join(libc, 'include', 'any-darwin-any'),
+                    os.path.join(dest, 'usr', 'include'))
+
+    with open(os.path.join(libc, 'darwin', 'libSystem.tbd')) as f:
+        tbd = f.read()
+    tbd = re.sub(r'targets:\s*\[([^\]]*)\]', fix_targets, tbd)
+    os.makedirs(os.path.join(dest, 'usr', 'lib'))
+    with open(os.path.join(dest, 'usr', 'lib', 'libSystem.tbd'), 'w') as f:
+        f.write(tbd)
+    # The SDK of Xcode links these to libSystem: -lm and the like work
+    for lib in LIBSYSTEM_ALIASES:
+        os.symlink('libSystem.tbd',
+                   os.path.join(dest, 'usr', 'lib', 'lib' + lib + '.tbd'))
+
+    # clang reads the version of the SDK from here
+    with open(os.path.join(dest, 'SDKSettings.json'), 'w') as f:
+        json.dump({'Version': version,
+                   'CanonicalName': 'macosx' + version,
+                   'MaximumDeploymentTarget': version + '.99'}, f)
+
+
+if __name__ == '__main__':
+    main()
