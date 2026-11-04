@@ -1,0 +1,110 @@
+#!/bin/sh
+# Copyright (C) 2026 Interpretica, Unipessoal Lda. All rights reserved.
+#
+# Cross tools of macOS for the Builder of TE. The name of the link tells
+# the target and the tool: aarch64-apple-darwin-gcc runs clang for arm64
+# macOS, x86_64-apple-darwin-ar runs llvm-ar, and so on.
+#
+# MACOS_SDK   the directory of the SDK of macOS (default /opt/macos-sdk)
+# MACOS_MIN   the oldest macOS to run the binaries on (default 11.0)
+# MACOS_DEPS  where the libraries of the target are built (default
+#             /opt/macos-deps): one prefix per target
+#
+# pkg-config sees only the libraries in MACOS_DEPS and in
+# MACOS_PKG_CONFIG_LIBDIR. On the first call it builds the libraries whose
+# sources the image carries (PCRE2 for ta_job).
+
+name=$(basename "$0")
+tool=${name##*-apple-darwin-}
+target=${name%-"${tool}"}
+sdk=${MACOS_SDK:-/opt/macos-sdk}
+min=${MACOS_MIN:-11.0}
+deps=${MACOS_DEPS:-/opt/macos-deps}/${target}
+src=/usr/local/src/te
+
+check_sdk() {
+    if [ ! -d "${sdk}/usr/include" ]; then
+        echo "${name}: no SDK of macOS in '${sdk}': mount one there or set" \
+             "MACOS_SDK" >&2
+        exit 1
+    fi
+}
+
+# Build the static PCRE2 of the target once. flock keeps the parallel
+# builds of the Builder from building it twice.
+build_deps() {
+    # The build of PCRE2 runs these wrappers itself
+    [ -z "${TE_APPLE_DEPS_BUILD}" ] || return 0
+    [ -f "${deps}/lib/pkgconfig/libpcre2-8.pc" ] && return 0
+    [ -f "${src}/pcre2.tar.bz2" ] || return 0
+    check_sdk
+    mkdir -p "${deps}"
+    (
+        export TE_APPLE_DEPS_BUILD=1
+        flock 9
+        [ -f "${deps}/lib/pkgconfig/libpcre2-8.pc" ] && exit 0
+        work=$(mktemp -d)
+        trap 'rm -rf "${work}"' EXIT
+        bsdtar -xjf "${src}/pcre2.tar.bz2" -C "${work}" --strip-components=1
+        cd "${work}" || exit 1
+        ./configure --host="${target}" --prefix="${deps}" \
+            CC="${target}-gcc" AR="${target}-ar" RANLIB="${target}-ranlib" \
+            NM="${target}-nm" STRIP="${target}-strip" \
+            --disable-shared --enable-static --disable-pcre2grep-jit \
+            >"${work}.log" 2>&1 &&
+        make -j"$(nproc)" install >>"${work}.log" 2>&1 || {
+            echo "${name}: PCRE2 build failed:" >&2
+            tail -20 "${work}.log" >&2
+            exit 1
+        }
+        rm -f "${work}.log"
+    ) 9>"${deps}/.lock" >&2
+}
+
+# The archive tools do not need the SDK
+case "${tool}" in
+    ar)         exec llvm-ar "$@" ;;
+    ranlib)     exec llvm-ranlib "$@" ;;
+    nm)         exec llvm-nm "$@" ;;
+    strip)      exec llvm-strip "$@" ;;
+    pkg-config)
+        build_deps || exit 1
+        # Keep the libraries of the build host away from the target
+        PKG_CONFIG_LIBDIR=${deps}/lib/pkgconfig${MACOS_PKG_CONFIG_LIBDIR:+:${MACOS_PKG_CONFIG_LIBDIR}} \
+        exec pkg-config "$@" ;;
+esac
+
+check_sdk
+build_deps || exit 1
+
+case "${tool}" in
+    gcc|cc|as)
+        # Name the linker only for a link: meson checks the compiler with
+        # -Werror=unused-command-line-argument
+        link=-fuse-ld=lld
+        for arg in "$@"; do
+            case "${arg}" in
+                -c|-E|-S|-M|-MM|-fsyntax-only) link= ;;
+            esac
+        done
+        # MACOS_DEPS is a part of the system for the target, as
+        # /opt/homebrew is on a Mac: the checks of headers see it
+        [ -z "${link}" ] || link="${link} -L${deps}/lib"
+        exec clang --target="${target}" -isysroot "${sdk}" \
+             -mmacosx-version-min="${min}" -idirafter "${deps}/include" \
+             ${link} "$@" ;;
+    cpp)
+        exec clang --target="${target}" -isysroot "${sdk}" \
+             -mmacosx-version-min="${min}" -idirafter "${deps}/include" \
+             -E "$@" ;;
+    ld)
+        case "${target}" in
+            aarch64-*) arch=arm64 ;;
+            *)         arch=x86_64 ;;
+        esac
+        exec ld64.lld -arch "${arch}" -syslibroot "${sdk}" \
+             -platform_version macos "${min}" "${min}" "$@" ;;
+esac
+
+echo "${name}: unknown tool '${tool}'" >&2
+exit 1
