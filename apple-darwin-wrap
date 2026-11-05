@@ -1,0 +1,133 @@
+#!/bin/sh
+# Copyright (C) 2026 Interpretica, Unipessoal Lda. All rights reserved.
+#
+# Cross tools of macOS for the Builder of TE. The name of the link tells
+# the target and the tool: aarch64-apple-darwin-gcc runs clang for arm64
+# macOS, x86_64-apple-darwin-ar runs llvm-ar, and so on.
+#
+# MACOS_SDK   the directory of the SDK of macOS (default /opt/macos-sdk).
+#             Without one there, the open SDK of the image is used.
+# MACOS_OPEN_SDK  the open SDK (default /opt/macos-sdk-open)
+# MACOS_MIN   the oldest macOS to run the binaries on (default 11.0)
+# MACOS_DEPS  where the libraries of the target are built (default
+#             /opt/macos-deps): one prefix per target
+#
+# pkg-config sees only the libraries in MACOS_DEPS and in
+# MACOS_PKG_CONFIG_LIBDIR. On the first call it builds the libraries whose
+# sources the image carries: PCRE2 for ta_job, and libpcap for TAD if the
+# SDK lacks it, as the open SDK does.
+
+name=$(basename "$0")
+tool=${name##*-apple-darwin-}
+target=${name%-"${tool}"}
+sdk=${MACOS_SDK:-/opt/macos-sdk}
+[ -d "${sdk}/usr/include" ] || sdk=${MACOS_OPEN_SDK:-/opt/macos-sdk-open}
+min=${MACOS_MIN:-11.0}
+deps=${MACOS_DEPS:-/opt/macos-deps}/${target}
+src=/usr/local/src/te
+
+check_sdk() {
+    if [ ! -d "${sdk}/usr/include" ]; then
+        echo "${name}: no SDK of macOS in '${sdk}': mount one at" \
+             "MACOS_SDK" >&2
+        exit 1
+    fi
+}
+
+# Build a static library of the target from an archive of the image, if
+# the image carries it. $1 is the name of its .pc file, $2 is the archive,
+# the rest are the options of configure.
+build_dep() {
+    pc=$1
+    archive=${src}/$2
+    shift 2
+    [ -f "${deps}/lib/pkgconfig/${pc}.pc" ] && return 0
+    [ -f "${archive}" ] || return 0
+    work=$(mktemp -d)
+    bsdtar -xf "${archive}" -C "${work}" --strip-components=1
+    (
+        cd "${work}" &&
+        ./configure --host="${target}" --prefix="${deps}" \
+            CC="${target}-gcc" AR="${target}-ar" RANLIB="${target}-ranlib" \
+            NM="${target}-nm" STRIP="${target}-strip" \
+            --disable-shared --enable-static "$@" &&
+        make -j"$(nproc)" &&
+        make install
+    ) >"${work}.log" 2>&1 || {
+        echo "${name}: ${pc} build failed:" >&2
+        tail -20 "${work}.log" >&2
+        rm -rf "${work}" "${work}.log"
+        return 1
+    }
+    rm -rf "${work}" "${work}.log"
+}
+
+# Build the static libraries of the target once. flock keeps the parallel
+# builds of the Builder from building them twice.
+build_deps() {
+    # The builds of the libraries run these wrappers themselves
+    [ -z "${TE_APPLE_DEPS_BUILD}" ] || return 0
+    [ -f "${deps}/.done" ] && return 0
+    check_sdk
+    mkdir -p "${deps}"
+    (
+        export TE_APPLE_DEPS_BUILD=1
+        flock 9
+        [ -f "${deps}/.done" ] && exit 0
+        build_dep libpcre2-8 pcre2.tar.bz2 --disable-pcre2grep-jit || exit 1
+        # The SDK of Xcode has libpcap
+        if [ ! -e "${sdk}/usr/lib/libpcap.tbd" ]; then
+            build_dep libpcap libpcap.tar.xz --disable-universal \
+                --without-libnl --disable-dbus --disable-rdma || exit 1
+        fi
+        touch "${deps}/.done"
+    ) 9>"${deps}/.lock" >&2
+}
+
+# The archive tools do not need the SDK
+case "${tool}" in
+    ar)         exec llvm-ar "$@" ;;
+    ranlib)     exec llvm-ranlib "$@" ;;
+    nm)         exec llvm-nm "$@" ;;
+    strip)      exec llvm-strip "$@" ;;
+    pkg-config)
+        build_deps || exit 1
+        # Keep the libraries of the build host away from the target
+        PKG_CONFIG_LIBDIR=${deps}/lib/pkgconfig${MACOS_PKG_CONFIG_LIBDIR:+:${MACOS_PKG_CONFIG_LIBDIR}} \
+        exec pkg-config "$@" ;;
+esac
+
+check_sdk
+build_deps || exit 1
+
+case "${tool}" in
+    gcc|cc|as)
+        # Name the linker only for a link: meson checks the compiler with
+        # -Werror=unused-command-line-argument
+        link=-fuse-ld=lld
+        for arg in "$@"; do
+            case "${arg}" in
+                -c|-E|-S|-M|-MM|-fsyntax-only) link= ;;
+            esac
+        done
+        # MACOS_DEPS is a part of the system for the target, as
+        # /opt/homebrew is on a Mac: the checks of headers see it
+        [ -z "${link}" ] || link="${link} -L${deps}/lib"
+        exec clang --target="${target}" -isysroot "${sdk}" \
+             -mmacosx-version-min="${min}" -idirafter "${deps}/include" \
+             ${link} "$@" ;;
+    cpp)
+        exec clang --target="${target}" -isysroot "${sdk}" \
+             -mmacosx-version-min="${min}" -idirafter "${deps}/include" \
+             -E "$@" ;;
+    ld)
+        case "${target}" in
+            aarch64-*) arch=arm64 ;;
+            *)         arch=x86_64 ;;
+        esac
+        exec ld64.lld -arch "${arch}" -syslibroot "${sdk}" \
+             -platform_version macos "${min}" "${min}" "$@" ;;
+esac
+
+echo "${name}: unknown tool '${tool}'" >&2
+exit 1
